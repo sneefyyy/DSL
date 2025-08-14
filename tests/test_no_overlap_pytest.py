@@ -1,5 +1,16 @@
 import json
-from datasets import load_from_disk
+from pathlib import Path
+import importlib.util
+
+# Load create_hf_dataset.py directly from repository root so tests don't depend
+# on sys.path or package layout.
+root = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location(
+    "create_hf_dataset", str(root / "create_hf_dataset.py")
+)
+create_hf_dataset_mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(create_hf_dataset_mod)
+create_hf_dataset = create_hf_dataset_mod.create_hf_dataset
 
 
 def canonicalize(example):
@@ -10,7 +21,9 @@ def canonicalize(example):
 
 
 def test_no_overlap():
-    ds = load_from_disk("dsl_dataset")
+    # Build the dataset in-memory from the JSON_training/ directory so tests
+    # do not rely on a local saved dsl_dataset/ directory.
+    ds = create_hf_dataset('JSON_training/', train_frac=0.90, val_frac=0.05, seed=42)
 
     splits = ["train", "validation", "test"]
 
@@ -19,8 +32,7 @@ def test_no_overlap():
 
     for split in splits:
         if split not in ds:
-            # If a split is missing, test should fail
-            raise AssertionError(f"Expected split '{split}' in dsl_dataset but it was not found")
+            raise AssertionError(f"Expected split '{split}' but it was not found")
         for idx, ex in enumerate(ds[split]):
             key = canonicalize(ex)
             if key in seen:
