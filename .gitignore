@@ -50,3 +50,6 @@ wandb/
 tmp-finetune/
 dsl_dataset*
 DSL-mirror.git/
+wandb/
+tmp-finetune/
+dsl_dataset*
