@@ -56,3 +56,8 @@ dsl_dataset*
 wandb/
 tmp-finetune/
 dsl_dataset*
+dsl_dataset*
+parquet/
+wandb/
+tmp-finetune/
+
