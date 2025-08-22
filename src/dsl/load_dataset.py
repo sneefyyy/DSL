@@ -3,29 +3,31 @@ from datasets import load_from_disk, load_dataset
 import json
 
 def format_example_for_training(example):
-    """Format a single example for model training."""
+    """Format a single example for model training (no task_type, full solution)."""
     
     # Create the input prompt
-    prompt = f"""Task: {example['task_type']}
+    prompt = (
+        "Training Example 1:\n"
+        f"Input: {json.dumps(example['train_input1'])}\n"
+        f"Output: {json.dumps(example['train_output1'])}\n\n"
+        "Training Example 2:\n"
+        f"Input: {json.dumps(example['train_input2'])}\n"
+        f"Output: {json.dumps(example['train_output2'])}\n\n"
+        f"Test Input: {json.dumps(example['test_input'])}\n"
+        "Test Output: "
+    )
 
-Training Example 1:
-Input: {json.dumps(example['train_input1'])}
-Output: {json.dumps(example['train_output1'])}
-
-Training Example 2:
-Input: {json.dumps(example['train_input2'])}
-Output: {json.dumps(example['train_output2'])}
-
-Test Input: {json.dumps(example['test_input'])}
-Test Output: """
-
-    # The target/label is the solution
-    target = example['solution'][0]  # Get the first solution line
+    # Get the solution
+    sol = example.get('solution', '')
+    if isinstance(sol, (list, tuple)):
+        completion = "\n".join(str(line) for line in sol)
+    else:
+        completion = str(sol)
     
     return {
         'prompt': prompt,
-        'completion': target,
-        'full_text': prompt + target
+        'completion': completion,
+        'full_text': prompt + completion
     }
 
 def prepare_dataset_for_training(dataset_path):

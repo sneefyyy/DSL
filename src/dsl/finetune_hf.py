@@ -39,24 +39,30 @@ logger = logging.getLogger(__name__)
 
 
 def format_example_for_training_local(example):
-	# Inline formatting mirroring load_dataset.format_example_for_training
-	import json
-	prompt = f"""Task: {example['task_type']}
+	"""Format a single example into prompt/completion.
 
-Training Example 1:
-Input: {json.dumps(example['train_input1'])}
-Output: {json.dumps(example['train_output1'])}
-
-Training Example 2:
-Input: {json.dumps(example['train_input2'])}
-Output: {json.dumps(example['train_output2'])}
-
-Test Input: {json.dumps(example['test_input'])}
-Test Output: """
-
-	# Use the first solution line as the expected completion
-	target = example['solution'][0] if isinstance(example.get('solution'), (list, tuple)) else example.get('solution', '')
-	return {'prompt': prompt, 'completion': target}
+	There is no task_type field anymore. The prompt shows two training IO pairs and
+	then the test input with a trailing 'Test Output: ' cue. The completion is the
+	ENTIRE solution (all lines joined by newlines) so the model learns the full
+	multi-line program, not only the first line.
+	"""
+	import json as _json
+	prompt = (
+		"Training Example 1:\n"
+		f"Input: {_json.dumps(example['train_input1'])}\n"
+		f"Output: {_json.dumps(example['train_output1'])}\n\n"
+		"Training Example 2:\n"
+		f"Input: {_json.dumps(example['train_input2'])}\n"
+		f"Output: {_json.dumps(example['train_output2'])}\n\n"
+		f"Test Input: {_json.dumps(example['test_input'])}\n"
+		"Test Output: "
+	)
+	sol = example.get('solution', '')
+	if isinstance(sol, (list, tuple)):
+		completion = "\n".join(str(line) for line in sol)
+	else:
+		completion = str(sol)
+	return {'prompt': prompt, 'completion': completion, 'full_text': prompt + completion}
 
 
 def tokenize_and_build_labels(example, tokenizer, max_length=1024):
@@ -300,6 +306,7 @@ def main():
 	parser.add_argument('--per_device_train_batch_size', type=int, default=4)
 	parser.add_argument('--per_device_eval_batch_size', type=int, default=4)
 	parser.add_argument('--num_train_epochs', type=int, default=1)
+	parser.add_argument('--max_steps', type=int, default=None, help='Override number of training steps (used for smoke tests).')
 	parser.add_argument('--learning_rate', type=float, default=5e-5)
 	parser.add_argument('--max_length', type=int, default=1024)
 	parser.add_argument('--push_to_hub', action='store_true')
@@ -314,6 +321,9 @@ def main():
 	parser.add_argument('--peft_r', type=int, default=8, help='LoRA rank')
 	parser.add_argument('--peft_alpha', type=int, default=32, help='LoRA alpha')
 	parser.add_argument('--peft_target_modules', type=str, default=None, help='Comma-separated list of module names for LoRA to target (optional)')
+	# Lightweight smoke-test sampling BEFORE tokenization
+	parser.add_argument('--limit_train_samples', type=int, default=None, help='If set, limit number of raw train examples before tokenization (smoke test).')
+	parser.add_argument('--limit_eval_samples', type=int, default=None, help='If set, limit number of raw validation examples before tokenization (smoke test).')
 	args = parser.parse_args()
 
 	logger.info('Loading dataset: %s', args.dataset_id)
@@ -328,6 +338,21 @@ def main():
 			ds = load_dataset(args.dataset_id)
 	else:
 		ds = load_dataset(args.dataset_id)
+
+	# Optional pre-tokenization subsampling for smoke tests
+	if args.limit_train_samples is not None and 'train' in ds:
+		logger.info('Limiting train split to first %d examples for smoke test', args.limit_train_samples)
+		try:
+			from datasets import Dataset
+			ds['train'] = ds['train'].select(range(min(args.limit_train_samples, len(ds['train']))))
+		except Exception:
+			pass
+	if args.limit_eval_samples is not None and 'validation' in ds:
+		logger.info('Limiting validation split to first %d examples for smoke test', args.limit_eval_samples)
+		try:
+			ds['validation'] = ds['validation'].select(range(min(args.limit_eval_samples, len(ds['validation']))))
+		except Exception:
+			pass
 
 	# Map formatting to prompt/completion
 	logger.info('Formatting examples (prompt/completion)')
@@ -425,6 +450,13 @@ def main():
 		training_kwargs['greater_is_better'] = (True if args.early_stopping_metric == 'exact_match' else False)
 	else:
 		training_kwargs['load_best_model_at_end'] = False
+
+	# Allow overriding max_steps for smoke tests; if provided set num_train_epochs large enough
+	if args.max_steps is not None and args.max_steps > 0:
+		training_kwargs['max_steps'] = args.max_steps
+		# Avoid saving too frequently in a tiny run; disable epoch-based saves if steps override is used
+		training_kwargs['save_strategy'] = 'no'
+		logger.info('Smoke test mode: overriding max_steps=%d', args.max_steps)
 
 	training_args = TrainingArguments(**training_kwargs)
 
