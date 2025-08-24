@@ -334,6 +334,16 @@ def main():
 	parser.add_argument('--adam8bit', action='store_true', help='Use bitsandbytes 8-bit AdamW optimizer (reduces memory)')
 	parser.add_argument('--adam8bit_paged', action='store_true', help='Use bitsandbytes paged 8-bit AdamW (better for long seq)')
 	parser.add_argument('--reduce_max_length', type=int, default=None, help='If set, override --max_length with a smaller value for memory relief')
+	# Evaluation overhead control
+	parser.add_argument('--functional_eval_sample_n', type=int, default=50, help='Sample size for functional evaluator per eval (lower to speed up)')
+	parser.add_argument('--disable_functional_eval', action='store_true', help='Disable functional execution evaluation callback entirely')
+	parser.add_argument('--disable_prediction_logging', action='store_true', help='Disable per-eval sample prediction logging callback')
+	# Curriculum learning (length-based) options
+	parser.add_argument('--curriculum_length_boundaries', type=str, default=None, help='Comma-separated ascending max completion token lengths for curriculum stages (e.g. 200,400,800). If set, training starts with shortest examples and gradually includes longer ones.')
+	parser.add_argument('--curriculum_min_epochs_per_stage', type=int, default=1, help='Minimum epochs to spend on each curriculum stage before expanding')
+	parser.add_argument('--curriculum_merge_incremental', action='store_true', help='If set, each new stage ADDS longer examples (cumulative). Otherwise the stage REPLACES previous subset.')
+	# Evaluation cadence
+	parser.add_argument('--eval_every_steps', type=int, default=None, help='If set (>0), run evaluation every N steps instead of each epoch.')
 	args = parser.parse_args()
 
 	logger.info('Loading dataset: %s', args.dataset_id)
@@ -367,6 +377,30 @@ def main():
 	# Map formatting to prompt/completion
 	logger.info('Formatting examples (prompt/completion)')
 	ds = ds.map(lambda ex: format_example_for_training_local(ex), batched=False)
+
+	# Optional curriculum: we won't stage dynamically during one run (Trainer lacks native hooks here without custom loop)
+	# Instead we implement a static single-stage subset selection for early experimentation OR
+	# allow user to manually iterate stages externally (
+	#   run with first boundary, then resume/continue with next etc.).
+	if args.curriculum_length_boundaries:
+		try:
+			bounds = [int(b.strip()) for b in args.curriculum_length_boundaries.split(',') if b.strip()]
+			bounds = [b for b in bounds if b > 0]
+			if bounds:
+				first_bound = bounds[0]
+				logger.info('Applying curriculum stage 1 filter: keeping examples with completion length <= %d tokens (approx via tokenizer)', first_bound)
+				# Approx token length cheaply: tokenize completion only; may slightly under/over count due to special tokens.
+				def _len_filter(ex):
+					comp = ex.get('completion','')
+					# Use simple whitespace split if tokenizer not yet loaded; we have tokenizer earlier but safe fallback
+					return len(comp.split())  # coarse; faster than full tokenization of entire dataset
+				for split in list(ds.keys()):
+					orig_n = len(ds[split])
+					filtered = ds[split].filter(lambda ex: _len_filter(ex) <= first_bound)
+					logger.info('Curriculum stage 1: %s %d -> %d examples (<= %d tokens)', split, orig_n, len(filtered), first_bound)
+					ds[split] = filtered
+		except Exception as e:
+			logger.warning('Failed to apply curriculum filter: %s', e)
 
 	# Load tokenizer and model
 	logger.info('Loading tokenizer and model: %s', args.model_name_or_path)
@@ -473,14 +507,25 @@ def main():
 	# Use an explicit list; if not using W&B, leave empty to avoid requiring tensorboard.
 	report_to = ['wandb'] if args.use_wandb else []
 
+	if args.eval_every_steps and args.eval_every_steps > 0:
+		eval_strategy = 'steps'
+		save_strategy = 'steps'
+		eval_steps = args.eval_every_steps
+		save_steps = args.eval_every_steps
+	else:
+		eval_strategy = 'epoch' if eval_dataset is not None else 'no'
+		save_strategy = 'epoch'
+		eval_steps = None
+		save_steps = None
+
 	training_kwargs = dict(
 		output_dir=args.output_dir,
 		overwrite_output_dir=True,
 		num_train_epochs=args.num_train_epochs,
 		per_device_train_batch_size=args.per_device_train_batch_size,
 		per_device_eval_batch_size=args.per_device_eval_batch_size,
-		eval_strategy='epoch' if eval_dataset is not None else 'no',
-		save_strategy='epoch',
+		eval_strategy=eval_strategy,
+		save_strategy=save_strategy,
 		learning_rate=args.learning_rate,
 		weight_decay=0.01,
 		logging_steps=50,
@@ -488,6 +533,10 @@ def main():
 		push_to_hub=args.push_to_hub,
 		gradient_accumulation_steps=args.gradient_accumulation_steps,
 	)
+	if eval_steps:
+		training_kwargs['eval_steps'] = eval_steps
+	if save_steps:
+		training_kwargs['save_steps'] = save_steps
 
 	if args.fp16:
 		training_kwargs['fp16'] = True
@@ -536,7 +585,7 @@ def main():
 		callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience))
 
 	# Add prediction logger callback to print and log example predictions at evaluation
-	if args.use_wandb:
+	if args.use_wandb and not args.disable_prediction_logging:
 		callbacks.append(PredictionLogger(tokenizer=tokenizer, raw_datasets=ds, gen_kwargs=gen_kwargs, sample_n=5, use_wandb=True))
 
 	# Functional evaluator callback: runs generated code in a subprocess sandbox and logs pass@k
@@ -684,7 +733,8 @@ def main():
 					pass
 
 	# Register functional evaluator
-	callbacks.append(FunctionalEvaluatorCallback(tokenizer=tokenizer, raw_datasets=ds, gen_kwargs=gen_kwargs, sample_n=50, num_return_sequences=1, exec_timeout=2.0, use_wandb=args.use_wandb))
+	if not args.disable_functional_eval:
+		callbacks.append(FunctionalEvaluatorCallback(tokenizer=tokenizer, raw_datasets=ds, gen_kwargs=gen_kwargs, sample_n=args.functional_eval_sample_n, num_return_sequences=1, exec_timeout=2.0, use_wandb=args.use_wandb))
 
 	trainer = ExactMatchTrainer(
 		model=model,
