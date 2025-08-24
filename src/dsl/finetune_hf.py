@@ -349,6 +349,7 @@ def main():
 	parser.add_argument('--dataloader_num_workers', type=int, default=0, help='Number of DataLoader worker processes')
 	parser.add_argument('--dataloader_pin_memory', action='store_true', help='Pin host memory in DataLoader for faster HtoD copies')
 	parser.add_argument('--use_flash_attention_2', action='store_true', help='Attempt to load model with Flash Attention 2 (requires supported architecture & installed kernels)')
+	parser.add_argument('--logging_steps', type=int, default=50, help='Log training loss every N steps')
 	args = parser.parse_args()
 
 	logger.info('Loading dataset: %s', args.dataset_id)
@@ -552,7 +553,7 @@ def main():
 		save_strategy=save_strategy,
 		learning_rate=args.learning_rate,
 		weight_decay=0.01,
-		logging_steps=50,
+		logging_steps=args.logging_steps,
 		report_to=report_to,
 		push_to_hub=args.push_to_hub,
 		gradient_accumulation_steps=args.gradient_accumulation_steps,
