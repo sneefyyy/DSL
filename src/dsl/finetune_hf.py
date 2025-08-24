@@ -321,9 +321,19 @@ def main():
 	parser.add_argument('--peft_r', type=int, default=8, help='LoRA rank')
 	parser.add_argument('--peft_alpha', type=int, default=32, help='LoRA alpha')
 	parser.add_argument('--peft_target_modules', type=str, default=None, help='Comma-separated list of module names for LoRA to target (optional)')
+	parser.add_argument('--peft_auto_target', action='store_true', help='Automatically detect common attention/MLP linear modules for LoRA if target modules not provided')
 	# Lightweight smoke-test sampling BEFORE tokenization
 	parser.add_argument('--limit_train_samples', type=int, default=None, help='If set, limit number of raw train examples before tokenization (smoke test).')
 	parser.add_argument('--limit_eval_samples', type=int, default=None, help='If set, limit number of raw validation examples before tokenization (smoke test).')
+	parser.add_argument('--tpu_num_cores', type=int, default=None, help='Number of TPU cores (set when running on TPU with torch_xla).')
+	# Memory / performance knobs
+	parser.add_argument('--gradient_checkpointing', action='store_true', help='Enable gradient checkpointing to reduce activation memory')
+	parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps (effective batch = per_device_batch * this)')
+	parser.add_argument('--fp16', action='store_true', help='Enable fp16 mixed precision training')
+	parser.add_argument('--bf16', action='store_true', help='Enable bf16 mixed precision training (ampere+ / TPU)')
+	parser.add_argument('--adam8bit', action='store_true', help='Use bitsandbytes 8-bit AdamW optimizer (reduces memory)')
+	parser.add_argument('--adam8bit_paged', action='store_true', help='Use bitsandbytes paged 8-bit AdamW (better for long seq)')
+	parser.add_argument('--reduce_max_length', type=int, default=None, help='If set, override --max_length with a smaller value for memory relief')
 	args = parser.parse_args()
 
 	logger.info('Loading dataset: %s', args.dataset_id)
@@ -368,14 +378,47 @@ def main():
 	model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
 	model.resize_token_embeddings(len(tokenizer))
 
+	# Apply optional sequence length reduction early
+	if args.reduce_max_length is not None and args.reduce_max_length > 0 and args.reduce_max_length < args.max_length:
+		logger.info('Overriding max_length from %d to %d for memory reduction', args.max_length, args.reduce_max_length)
+		args.max_length = args.reduce_max_length
+
+	# Gradient checkpointing (must disable use_cache for some architectures)
+	if args.gradient_checkpointing:
+		try:
+			model.gradient_checkpointing_enable()
+			if hasattr(model, 'config') and getattr(model.config, 'use_cache', None) is True:
+				model.config.use_cache = False
+			logger.info('Enabled gradient checkpointing and disabled use_cache')
+		except Exception as e:
+			logger.warning('Could not enable gradient checkpointing: %s', e)
+
 	# Optionally apply PEFT/LoRA
 	if args.use_peft:
 		try:
 			from peft import get_peft_model, LoraConfig, TaskType
-			# Build target modules list if provided
+			# Determine target modules
 			target_modules = None
 			if args.peft_target_modules:
 				target_modules = [m.strip() for m in args.peft_target_modules.split(',') if m.strip()]
+			elif args.peft_auto_target:
+				# Auto-detect linear submodules typical for attention/MLP
+				import torch.nn as nn
+				candidate_substrings = ['q_proj','k_proj','v_proj','o_proj','wq','wk','wv','wo','gate_proj','up_proj','down_proj','fc1','fc2','proj']
+				seen = set()
+				for name, module in model.named_modules():
+					if not isinstance(module, nn.Linear):
+						continue
+					if any(s in name for s in candidate_substrings):
+						# Use the final segment as module name reference
+						leaf = name.split('.')[-1]
+						seen.add(leaf)
+						if len(seen) >= 64:  # safety bound
+							break
+				target_modules = sorted(seen) if seen else None
+				logger.info('Auto-detected LoRA target modules: %s', target_modules)
+			if target_modules is None:
+				logger.warning('LoRA target modules not specified/detected; this will fine-tune all parameters (high memory). Provide --peft_target_modules or --peft_auto_target.')
 			lora_config = LoraConfig(
 				r=args.peft_r,
 				lora_alpha=args.peft_alpha,
@@ -383,6 +426,7 @@ def main():
 				task_type=TaskType.CAUSAL_LM,
 			)
 			model = get_peft_model(model, lora_config)
+			logger.info('Enabled LoRA with r=%d alpha=%d on modules=%s', args.peft_r, args.peft_alpha, target_modules)
 		except Exception as e:
 			logger.warning('PEFT/LoRA requested but could not be enabled: %s', e)
 
@@ -442,7 +486,22 @@ def main():
 		logging_steps=50,
 		report_to=report_to,
 		push_to_hub=args.push_to_hub,
+		gradient_accumulation_steps=args.gradient_accumulation_steps,
 	)
+
+	if args.fp16:
+		training_kwargs['fp16'] = True
+	if args.bf16:
+		training_kwargs['bf16'] = True
+	if args.adam8bit or args.adam8bit_paged:
+		# Attempt to use bitsandbytes optimizer if installed
+		optim_name = 'paged_adamw_8bit' if args.adam8bit_paged else 'adamw_bnb_8bit'
+		try:
+			import bitsandbytes as bnb  # noqa: F401
+			training_kwargs['optim'] = optim_name
+			logger.info('Using bitsandbytes optimizer: %s', optim_name)
+		except Exception:
+			logger.warning('bitsandbytes not available; falling back to default optimizer')
 
 	if args.early_stopping_patience and args.early_stopping_patience > 0:
 		training_kwargs['load_best_model_at_end'] = True
@@ -459,6 +518,10 @@ def main():
 		logger.info('Smoke test mode: overriding max_steps=%d', args.max_steps)
 
 	training_args = TrainingArguments(**training_kwargs)
+
+	# If TPU requested, set attribute (HF Trainer will route to XLA devices if torch_xla installed)
+	if args.tpu_num_cores:
+		setattr(training_args, 'tpu_num_cores', args.tpu_num_cores)
 
 	gen_kwargs = {
 		'max_new_tokens': 64,
@@ -642,6 +705,28 @@ def main():
 
 	logger.info('Saving model to %s', args.output_dir)
 	trainer.save_model(args.output_dir)
+
+	# Optional test evaluation (was not automatic). We run this AFTER saving so it doesn't affect early stopping.
+	if 'test' in tokenized:
+		try:
+			logger.info('Evaluating on test split')
+			test_dataset = tokenized['test']
+			raw_correct, raw_total, raw_pct = trainer.compute_exact_match('test')
+			# Run standard evaluate() to get loss (will return eval_loss key)
+			test_metrics = trainer.evaluate(eval_dataset=test_dataset)
+			if 'eval_loss' in test_metrics:
+				test_metrics['test_loss'] = test_metrics.pop('eval_loss')
+			test_metrics['test_exact_match_pct'] = raw_pct * 100.0
+			logger.info('Test exact-match: %d/%d = %.4f', raw_correct, raw_total, raw_pct)
+			# Log to W&B if enabled
+			if args.use_wandb:
+				try:
+					import wandb as _wandb
+					_wandb.log({k: v for k, v in test_metrics.items() if k.startswith('test_')})
+				except Exception:
+					pass
+		except Exception as e:
+			logger.warning('Test evaluation failed: %s', e)
 
 	if args.push_to_hub:
 		logger.info('Pushing model to the Hub')
