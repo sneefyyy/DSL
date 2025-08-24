@@ -344,6 +344,11 @@ def main():
 	parser.add_argument('--curriculum_merge_incremental', action='store_true', help='If set, each new stage ADDS longer examples (cumulative). Otherwise the stage REPLACES previous subset.')
 	# Evaluation cadence
 	parser.add_argument('--eval_every_steps', type=int, default=None, help='If set (>0), run evaluation every N steps instead of each epoch.')
+	# Performance / system flags
+	parser.add_argument('--tf32', action='store_true', help='Enable TF32 matmul precision (Ampere+ GPUs)')
+	parser.add_argument('--dataloader_num_workers', type=int, default=0, help='Number of DataLoader worker processes')
+	parser.add_argument('--dataloader_pin_memory', action='store_true', help='Pin host memory in DataLoader for faster HtoD copies')
+	parser.add_argument('--use_flash_attention_2', action='store_true', help='Attempt to load model with Flash Attention 2 (requires supported architecture & installed kernels)')
 	args = parser.parse_args()
 
 	logger.info('Loading dataset: %s', args.dataset_id)
@@ -409,8 +414,27 @@ def main():
 	if tokenizer.pad_token is None:
 		tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token or tokenizer.sep_token or '<|pad|>'})
 
-	model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
+	model_kwargs = {}
+	if args.use_flash_attention_2:
+		# Some architectures allow specifying attn_implementation
+		model_kwargs['attn_implementation'] = 'flash_attention_2'
+	try:
+		model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs)
+	except Exception as e:
+		logger.warning('Flash Attention 2 load failed or unsupported (%s). Falling back to default load.', e)
+		model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
 	model.resize_token_embeddings(len(tokenizer))
+
+	# TF32 enable
+	if args.tf32:
+		try:
+			import torch
+			if torch.cuda.is_available():
+				torch.backends.cuda.matmul.allow_tf32 = True
+				torch.backends.cudnn.allow_tf32 = True
+				logger.info('Enabled TF32 matmul/cudnn')
+		except Exception as e:
+			logger.warning('Could not enable TF32: %s', e)
 
 	# Apply optional sequence length reduction early
 	if args.reduce_max_length is not None and args.reduce_max_length > 0 and args.reduce_max_length < args.max_length:
@@ -532,6 +556,8 @@ def main():
 		report_to=report_to,
 		push_to_hub=args.push_to_hub,
 		gradient_accumulation_steps=args.gradient_accumulation_steps,
+		dataloader_num_workers=args.dataloader_num_workers,
+		pin_memory=args.dataloader_pin_memory,
 	)
 	if eval_steps:
 		training_kwargs['eval_steps'] = eval_steps
