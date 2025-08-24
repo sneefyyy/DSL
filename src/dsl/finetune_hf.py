@@ -419,6 +419,14 @@ def main():
 	if args.use_flash_attention_2:
 		# Some architectures allow specifying attn_implementation
 		model_kwargs['attn_implementation'] = 'flash_attention_2'
+	# If bf16 requested, set dtype at load to avoid initial fp32 weights (helps flash attention warning & memory)
+	if getattr(args, 'bf16', False):
+		try:
+			import torch as _torch
+			model_kwargs['torch_dtype'] = _torch.bfloat16
+			logger.info('Loading model directly in bfloat16 dtype')
+		except Exception:
+			pass
 	try:
 		model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs)
 	except Exception as e:
@@ -558,7 +566,7 @@ def main():
 		push_to_hub=args.push_to_hub,
 		gradient_accumulation_steps=args.gradient_accumulation_steps,
 		dataloader_num_workers=args.dataloader_num_workers,
-		pin_memory=args.dataloader_pin_memory,
+		dataloader_pin_memory=args.dataloader_pin_memory,
 	)
 	if eval_steps:
 		training_kwargs['eval_steps'] = eval_steps
