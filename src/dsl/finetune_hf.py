@@ -308,6 +308,10 @@ def main():
 	parser.add_argument('--num_train_epochs', type=int, default=1)
 	parser.add_argument('--max_steps', type=int, default=None, help='Override number of training steps (used for smoke tests).')
 	parser.add_argument('--learning_rate', type=float, default=5e-5)
+	# Scheduler / warmup (helps stabilize early steps and reduce gibberish)
+	parser.add_argument('--lr_scheduler_type', type=str, default='linear', help='LR scheduler type (linear, cosine, cosine_with_restarts, polynomial, constant, constant_with_warmup, inverse_sqrt, reduce_lr_on_plateau)')
+	parser.add_argument('--warmup_ratio', type=float, default=0.0, help='Warmup ratio (fraction of total training steps). Ignored if --warmup_steps is set.')
+	parser.add_argument('--warmup_steps', type=int, default=None, help='Number of warmup steps (overrides --warmup_ratio when provided).')
 	parser.add_argument('--max_length', type=int, default=1024)
 	parser.add_argument('--push_to_hub', action='store_true')
 	parser.add_argument('--use_wandb', action='store_true', help='Enable logging to Weights & Biases')
@@ -322,6 +326,14 @@ def main():
 	parser.add_argument('--peft_alpha', type=int, default=32, help='LoRA alpha')
 	parser.add_argument('--peft_target_modules', type=str, default=None, help='Comma-separated list of module names for LoRA to target (optional)')
 	parser.add_argument('--peft_auto_target', action='store_true', help='Automatically detect common attention/MLP linear modules for LoRA if target modules not provided')
+	parser.add_argument('--peft_dropout', type=float, default=0.05, help='LoRA dropout (helps regularize when using higher rank)')
+	parser.add_argument('--trust_remote_code', action='store_true', help='Pass trust_remote_code=True when loading tokenizer/model (needed for some repos like Qwen)')
+	# Quantization / memory flags for large models
+	parser.add_argument('--load_in_4bit', action='store_true', help='Load model in 4-bit (bnb) precision (QLoRA style)')
+	parser.add_argument('--load_in_8bit', action='store_true', help='Load model in 8-bit (bnb) precision')
+	parser.add_argument('--bnb_compute_dtype', type=str, default='bfloat16', help='Compute dtype for 4-bit/8-bit (e.g. bfloat16, float16)')
+	parser.add_argument('--bnb_4bit_quant_type', type=str, default='nf4', choices=['nf4','fp4'], help='4-bit quantization data type')
+	parser.add_argument('--bnb_4bit_use_double_quant', action='store_true', help='Enable double quantization in 4-bit mode')
 	# Lightweight smoke-test sampling BEFORE tokenization
 	parser.add_argument('--limit_train_samples', type=int, default=None, help='If set, limit number of raw train examples before tokenization (smoke test).')
 	parser.add_argument('--limit_eval_samples', type=int, default=None, help='If set, limit number of raw validation examples before tokenization (smoke test).')
@@ -419,12 +431,28 @@ def main():
 
 	# Load tokenizer and model
 	logger.info('Loading tokenizer and model: %s', args.model_name_or_path)
-	tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+	tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code)
 	# Ensure pad token exists
 	if tokenizer.pad_token is None:
 		tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token or tokenizer.sep_token or '<|pad|>'})
 
 	model_kwargs = {}
+	# BitsAndBytes quantization config if requested
+	if args.load_in_4bit or args.load_in_8bit:
+		try:
+			from transformers import BitsAndBytesConfig
+			compute_dtype = getattr(torch, args.bnb_compute_dtype) if hasattr(torch, args.bnb_compute_dtype) else torch.bfloat16
+			bnb_config = BitsAndBytesConfig(
+				load_in_4bit=args.load_in_4bit,
+				load_in_8bit=args.load_in_8bit and not args.load_in_4bit,
+				bnb_4bit_compute_dtype=compute_dtype,
+				bnb_4bit_quant_type=args.bnb_4bit_quant_type,
+				bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
+			)
+			model_kwargs['quantization_config'] = bnb_config
+			logger.info('Enabled bitsandbytes quantization: 4bit=%s 8bit=%s type=%s compute=%s double_quant=%s', args.load_in_4bit, args.load_in_8bit, args.bnb_4bit_quant_type, args.bnb_compute_dtype, args.bnb_4bit_use_double_quant)
+		except Exception as _e:
+			logger.warning('Could not set up bitsandbytes quantization (%s). Proceeding without quant.', _e)
 	if args.use_flash_attention_2:
 		# Some architectures allow specifying attn_implementation
 		model_kwargs['attn_implementation'] = 'flash_attention_2'
@@ -437,10 +465,10 @@ def main():
 		except Exception:
 			pass
 	try:
-		model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs)
+		model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code, **model_kwargs)
 	except Exception as e:
 		logger.warning('Flash Attention 2 load failed or unsupported (%s). Falling back to default load.', e)
-		model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
+		model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code)
 	model.resize_token_embeddings(len(tokenizer))
 
 	# TF32 enable
@@ -499,6 +527,7 @@ def main():
 				r=args.peft_r,
 				lora_alpha=args.peft_alpha,
 				target_modules=target_modules,
+				lora_dropout=args.peft_dropout,
 				task_type=TaskType.CAUSAL_LM,
 			)
 			model = get_peft_model(model, lora_config)
@@ -569,6 +598,7 @@ def main():
 		eval_strategy=eval_strategy,
 		save_strategy=save_strategy,
 		learning_rate=args.learning_rate,
+		lr_scheduler_type=args.lr_scheduler_type,
 		weight_decay=0.01,
 		logging_steps=args.logging_steps,
 		report_to=report_to,
@@ -586,6 +616,29 @@ def main():
 		training_kwargs['fp16'] = True
 	if args.bf16:
 		training_kwargs['bf16'] = True
+
+	# Warmup configuration
+	if args.warmup_steps is not None and args.warmup_steps > 0:
+		training_kwargs['warmup_steps'] = args.warmup_steps
+	elif args.warmup_ratio and args.warmup_ratio > 0:
+		# Let HF handle warmup_ratio directly if supported; fallback to manual compute otherwise
+		try:
+			training_kwargs['warmup_ratio'] = args.warmup_ratio
+		except Exception:
+			# Manual approximate compute (may differ slightly from actual due to rounding)
+			try:
+				if 'max_steps' in training_kwargs:
+					total_steps = training_kwargs['max_steps']
+				else:
+					_world = int(os.environ.get('WORLD_SIZE','1'))
+					if train_dataset is not None:
+						num_examples = len(train_dataset)
+						per_device = args.per_device_train_batch_size
+						accum = args.gradient_accumulation_steps
+						total_steps = math.ceil(num_examples / (per_device * _world * accum)) * args.num_train_epochs
+					training_kwargs['warmup_steps'] = int(total_steps * args.warmup_ratio)
+			except Exception:
+				pass
 	if args.adam8bit or args.adam8bit_paged:
 		# Attempt to use bitsandbytes optimizer if installed
 		optim_name = 'paged_adamw_8bit' if args.adam8bit_paged else 'adamw_bnb_8bit'
