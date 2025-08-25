@@ -334,6 +334,7 @@ def main():
 	parser.add_argument('--bnb_compute_dtype', type=str, default='bfloat16', help='Compute dtype for 4-bit/8-bit (e.g. bfloat16, float16)')
 	parser.add_argument('--bnb_4bit_quant_type', type=str, default='nf4', choices=['nf4','fp4'], help='4-bit quantization data type')
 	parser.add_argument('--bnb_4bit_use_double_quant', action='store_true', help='Enable double quantization in 4-bit mode')
+	parser.add_argument('--device_map', type=str, default=None, help="Optional device map for model loading (e.g. 'auto' to spread across GPUs).")
 	# Lightweight smoke-test sampling BEFORE tokenization
 	parser.add_argument('--limit_train_samples', type=int, default=None, help='If set, limit number of raw train examples before tokenization (smoke test).')
 	parser.add_argument('--limit_eval_samples', type=int, default=None, help='If set, limit number of raw validation examples before tokenization (smoke test).')
@@ -440,19 +441,31 @@ def main():
 	# BitsAndBytes quantization config if requested
 	if args.load_in_4bit or args.load_in_8bit:
 		try:
+			import importlib
 			from transformers import BitsAndBytesConfig
-			compute_dtype = getattr(torch, args.bnb_compute_dtype) if hasattr(torch, args.bnb_compute_dtype) else torch.bfloat16
+			import torch as _torch  # local alias to avoid any scope confusion
+			if not importlib.util.find_spec('bitsandbytes'):
+				raise ImportError('bitsandbytes not installed. Install with: pip install bitsandbytes accelerate')
+			# Resolve compute dtype safely
+			compute_dtype = getattr(_torch, args.bnb_compute_dtype, _torch.bfloat16)
 			bnb_config = BitsAndBytesConfig(
 				load_in_4bit=args.load_in_4bit,
-				load_in_8bit=args.load_in_8bit and not args.load_in_4bit,
+				load_in_8bit=(args.load_in_8bit and not args.load_in_4bit),
 				bnb_4bit_compute_dtype=compute_dtype,
 				bnb_4bit_quant_type=args.bnb_4bit_quant_type,
 				bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
 			)
 			model_kwargs['quantization_config'] = bnb_config
 			logger.info('Enabled bitsandbytes quantization: 4bit=%s 8bit=%s type=%s compute=%s double_quant=%s', args.load_in_4bit, args.load_in_8bit, args.bnb_4bit_quant_type, args.bnb_compute_dtype, args.bnb_4bit_use_double_quant)
+			# Helpful diagnostics
+			if _torch.cuda.is_available():
+				try:
+					cc = _torch.cuda.get_device_capability(0)
+					logger.info('CUDA device capability: %s, torch cuda: %s, bitsandbytes expected >= 7.0 for 4-bit', cc, getattr(_torch.version, 'cuda', 'unknown'))
+				except Exception:
+					pass
 		except Exception as _e:
-			logger.warning('Could not set up bitsandbytes quantization (%s). Proceeding without quant.', _e)
+			logger.warning('Could not set up bitsandbytes quantization (%s). Proceeding without quant. (Ensure compatible CUDA, bitsandbytes version, and GPU capability >=7.0)', _e)
 	if args.use_flash_attention_2:
 		# Some architectures allow specifying attn_implementation
 		model_kwargs['attn_implementation'] = 'flash_attention_2'
@@ -464,11 +477,20 @@ def main():
 			logger.info('Loading model directly in bfloat16 dtype')
 		except Exception:
 			pass
+	# Optional device_map handling (e.g. --device_map auto)
+	if args.device_map:
+		model_kwargs['device_map'] = args.device_map
 	try:
-		model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code, **model_kwargs)
+		model = AutoModelForCausalLM.from_pretrained(
+			args.model_name_or_path,
+			trust_remote_code=args.trust_remote_code,
+			low_cpu_mem_usage=True,
+			**model_kwargs,
+		)
 	except Exception as e:
-		logger.warning('Flash Attention 2 load failed or unsupported (%s). Falling back to default load.', e)
-		model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code)
+		logger.warning('Model load with provided kwargs failed (%s). Retrying without advanced kwargs.', e)
+		fallback_kwargs = {k: v for k, v in model_kwargs.items() if k in ('quantization_config',)}
+		model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code, **fallback_kwargs)
 	model.resize_token_embeddings(len(tokenizer))
 
 	# TF32 enable
