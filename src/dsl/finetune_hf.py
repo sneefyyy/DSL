@@ -14,6 +14,50 @@ Usage (example):
 
 Be cautious: running full training requires GPU and enough disk space.
 """
+
+# ---------------------------------------------------------------------------
+# Robust temp directory fallback
+# Some Colab / restricted environments can surface a FileNotFoundError when
+# importing libraries (e.g. dill via datasets/multiprocess) if no writable
+# temp directory is detected. We proactively create one and set TMPDIR/TEMP/TMP
+# before importing those libs to avoid crashes like:
+#   FileNotFoundError: No usable temporary directory found
+# ---------------------------------------------------------------------------
+import os as _early_os
+try:
+	_candidate_dirs = [
+		_early_os.environ.get('TMPDIR'),
+		'/tmp',
+		'/content/tmp',  # Colab common path
+		'./.tmp'
+	]
+	_usable = None
+	for _d in _candidate_dirs:
+		if not _d:
+			continue
+		try:
+			_early_os.makedirs(_d, exist_ok=True)
+			# Need write & execute perms
+			if _early_os.access(_d, _early_os.W_OK | _early_os.X_OK):
+				_usable = _d
+				break
+		except Exception:
+			continue
+	if _usable is None:
+		# Last resort: attempt to create ./.tmp
+		try:
+			_early_os.makedirs('./.tmp', exist_ok=True)
+			if _early_os.access('./.tmp', _early_os.W_OK | _early_os.X_OK):
+				_usable = './.tmp'
+		except Exception:
+			pass
+	if _usable:
+		for _v in ('TMPDIR', 'TEMP', 'TMP'):
+			if not _early_os.environ.get(_v):
+				_early_os.environ[_v] = _usable
+except Exception:
+	# Silent – fallback not critical if environment already OK
+	pass
 import argparse
 import logging
 from datasets import load_dataset
