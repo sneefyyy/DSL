@@ -337,7 +337,7 @@ def main():
 	# Evaluation overhead control
 	parser.add_argument('--functional_eval_sample_n', type=int, default=50, help='Sample size for functional evaluator per eval (lower to speed up)')
 	parser.add_argument('--disable_functional_eval', action='store_true', help='Disable functional execution evaluation callback entirely')
-	parser.add_argument('--disable_prediction_logging', action='store_true', help='Disable per-eval sample prediction logging callback')
+	parser.add_argument('--disable_prediction_logging', action='store_true', help='Disable lightweight per-eval textual prediction table (does NOT affect functional eval). Speeds eval if you only care about executed code metrics.')
 	# Curriculum learning (length-based) options
 	parser.add_argument('--curriculum_length_boundaries', type=str, default=None, help='Comma-separated ascending max completion token lengths for curriculum stages (e.g. 200,400,800). If set, training starts with shortest examples and gradually includes longer ones.')
 	parser.add_argument('--curriculum_min_epochs_per_stage', type=int, default=1, help='Minimum epochs to spend on each curriculum stage before expanding')
@@ -350,6 +350,13 @@ def main():
 	parser.add_argument('--dataloader_pin_memory', action='store_true', help='Pin host memory in DataLoader for faster HtoD copies')
 	parser.add_argument('--use_flash_attention_2', action='store_true', help='Attempt to load model with Flash Attention 2 (requires supported architecture & installed kernels)')
 	parser.add_argument('--logging_steps', type=int, default=50, help='Log training loss every N steps')
+	parser.add_argument('--skip_final_test', action='store_true', help='Skip final test exact-match/loss evaluation after training (do it manually later)')
+	# Final functional test evaluation
+	parser.add_argument('--final_functional_test', action='store_true', help='At end of training, run functional execution evaluation on the test split (executes generated code)')
+	parser.add_argument('--final_functional_pass_k', type=int, default=1, help='Number of candidates (pass@k) for final functional test evaluation when --final_functional_test is set')
+	parser.add_argument('--final_functional_timeout', type=float, default=2.0, help='Per-candidate execution timeout (seconds) for final functional test evaluation')
+	parser.add_argument('--final_functional_sample_n', type=int, default=None, help='If set, sample this many test examples for final functional test (omit for full set)')
+	parser.add_argument('--eval_temp_enable_cache', action='store_true', help='Temporarily enable model.config.use_cache during generation in evaluations even if disabled for training (speeds up eval generation)')
 	args = parser.parse_args()
 
 	logger.info('Loading dataset: %s', args.dataset_id)
@@ -791,10 +798,10 @@ def main():
 	logger.info('Saving model to %s', args.output_dir)
 	trainer.save_model(args.output_dir)
 
-	# Optional test evaluation (was not automatic). We run this AFTER saving so it doesn't affect early stopping.
-	if 'test' in tokenized:
+	# Optional final test evaluation (skip when --skip_final_test)
+	if not args.skip_final_test and 'test' in tokenized:
 		try:
-			logger.info('Evaluating on test split')
+			logger.info('Evaluating on test split (final)')
 			test_dataset = tokenized['test']
 			raw_correct, raw_total, raw_pct = trainer.compute_exact_match('test')
 			# Run standard evaluate() to get loss (will return eval_loss key)
@@ -812,6 +819,120 @@ def main():
 					pass
 		except Exception as e:
 			logger.warning('Test evaluation failed: %s', e)
+
+	# Final functional execution evaluation (pass@k) if requested
+	if args.final_functional_test and 'test' in ds:
+		logger.info('Starting final functional execution evaluation on test split (pass@%d)', args.final_functional_pass_k)
+		import random, time, multiprocessing, queue as _queue, copy as _copy
+		model = trainer.model
+		model.eval()
+		device = next(model.parameters()).device
+		orig_use_cache = None
+		if args.eval_temp_enable_cache and hasattr(model, 'config'):
+			try:
+				orig_use_cache = getattr(model.config, 'use_cache', None)
+				model.config.use_cache = True
+				logger.info('Temporarily enabled use_cache for evaluation generation')
+			except Exception:
+				pass
+
+		gen_kwargs_final = dict(gen_kwargs)
+		gen_kwargs_final['num_return_sequences'] = max(1, args.final_functional_pass_k)
+		# Enable sampling if k>1 for diverse candidates
+		if args.final_functional_pass_k > 1:
+			gen_kwargs_final.setdefault('do_sample', True)
+			gen_kwargs_final.setdefault('temperature', 0.8)
+			gen_kwargs_final.setdefault('top_p', 0.95)
+
+		def _exec_worker(code, inp, q):
+			try:
+				ns = {'__builtins__': __builtins__}
+				try:
+					import generators
+					for name in dir(generators):
+						if name.startswith('_'): continue
+						try:
+							ns[name] = getattr(generators, name)
+						except Exception:
+							continue
+				except Exception:
+					pass
+				ns['test_input'] = inp
+				exec(code, ns)
+				out = ns.get('output_grid', ns.get('grid', None))
+				q.put(('OK', out))
+			except Exception:
+				import traceback as _tb
+				q.put(('ERR', _tb.format_exc()))
+
+		def run_exec(code_str, test_input, timeout):
+			q = multiprocessing.Queue()
+			p = multiprocessing.Process(target=_exec_worker, args=(code_str, test_input, q))
+			p.start()
+			try:
+				res_type, res = q.get(timeout=timeout)
+				p.join(timeout=0.05)
+				return res_type, res
+			except _queue.Empty:
+				try: p.terminate()
+				except Exception: pass
+				return 'TIMEOUT', None
+
+		test_raw = ds['test']
+		indices = list(range(len(test_raw)))
+		if args.final_functional_sample_n is not None and args.final_functional_sample_n < len(indices):
+			indices = random.sample(indices, args.final_functional_sample_n)
+
+		functional_pass = 0
+		passk_pass = 0
+		processed = 0
+		start_time = time.time()
+
+		for idx in indices:
+			ex = dict(test_raw[idx])
+			prompt = ex.get('prompt')
+			if not prompt:
+				continue
+			inputs = tokenizer(prompt, return_tensors='pt')
+			inputs = {k: v.to(device) for k, v in inputs.items()}
+			with torch.no_grad():
+				outs = model.generate(**inputs, **gen_kwargs_final)
+			if isinstance(outs, torch.Tensor):
+				outs_list = outs
+			else:
+				outs_list = outs
+			input_len = inputs['input_ids'].shape[1]
+			any_func = False
+			for seq in outs_list:
+				seq_ids = seq[input_len:].cpu().tolist()
+				cand = tokenizer.decode(seq_ids, skip_special_tokens=True).strip()
+				cand_lines = [l for l in cand.splitlines() if l.strip()]
+				code_str = '\n'.join(cand_lines)
+				res_type, res = run_exec(code_str, _copy.deepcopy(ex.get('test_input')), timeout=args.final_functional_timeout)
+				if res_type == 'OK' and res == ex.get('test_output'):
+					any_func = True
+			if any_func:
+				functional_pass += 1
+				passk_pass += 1
+			processed += 1
+			if processed % 20 == 0:
+				elapsed = time.time() - start_time
+				logger.info('Final functional eval progress %d/%d (%.1fs elapsed)', processed, len(indices), elapsed)
+
+		functional_pct = (functional_pass/processed) if processed else 0.0
+		passk_pct = (passk_pass/processed) if processed else 0.0
+		logger.info('Final functional test results: functional_exact=%.2f%% pass@%d=%.2f%% on %d examples', functional_pct*100.0, args.final_functional_pass_k, passk_pct*100.0, processed)
+		if args.use_wandb:
+			try:
+				import wandb as _wandb
+				_wandb.log({'final_functional_exact_pct': functional_pct*100.0, f'final_pass_at_{args.final_functional_pass_k}': passk_pct*100.0, 'final_functional_examples': processed})
+			except Exception:
+				pass
+		if orig_use_cache is not None:
+			try:
+				model.config.use_cache = orig_use_cache
+			except Exception:
+				pass
 
 	if args.push_to_hub:
 		logger.info('Pushing model to the Hub')
