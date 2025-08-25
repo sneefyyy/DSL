@@ -357,6 +357,8 @@ def main():
 	parser.add_argument('--final_functional_timeout', type=float, default=2.0, help='Per-candidate execution timeout (seconds) for final functional test evaluation')
 	parser.add_argument('--final_functional_sample_n', type=int, default=None, help='If set, sample this many test examples for final functional test (omit for full set)')
 	parser.add_argument('--eval_temp_enable_cache', action='store_true', help='Temporarily enable model.config.use_cache during generation in evaluations even if disabled for training (speeds up eval generation)')
+	# Console sample printing
+	parser.add_argument('--print_train_example_every', type=int, default=0, help='If >0, every N optimizer steps print a random training example prompt + target + current model prediction.')
 	args = parser.parse_args()
 
 	logger.info('Loading dataset: %s', args.dataset_id)
@@ -629,6 +631,49 @@ def main():
 	# Add prediction logger callback to print and log example predictions at evaluation
 	if args.use_wandb and not args.disable_prediction_logging:
 		callbacks.append(PredictionLogger(tokenizer=tokenizer, raw_datasets=ds, gen_kwargs=gen_kwargs, sample_n=5, use_wandb=True))
+
+	# Lightweight periodic train sample printer
+	if args.print_train_example_every and args.print_train_example_every > 0:
+		class TrainSamplePrinterCallback(TrainerCallback):
+			def __init__(self, raw_datasets, tokenizer, gen_kwargs, every):
+				self.raw_datasets = raw_datasets
+				self.tokenizer = tokenizer
+				self.gen_kwargs = gen_kwargs
+				self.every = every
+			def on_step_end(self, args, state, control, **kwargs):
+				if state.global_step is None or state.global_step == 0:
+					return
+				if state.global_step % self.every != 0:
+					return
+				train_ds = self.raw_datasets.get('train')
+				if not train_ds or len(train_ds) == 0:
+					return
+				# Random example
+				import random
+				ex = dict(train_ds[random.randrange(len(train_ds))])
+				prompt = ex.get('prompt')
+				target = ex.get('completion','').strip()
+				if not prompt:
+					return
+				model = kwargs.get('model')
+				if model is None:
+					return
+				device = next(model.parameters()).device
+				inputs = self.tokenizer(prompt, return_tensors='pt')
+				inputs = {k: v.to(device) for k,v in inputs.items()}
+				with torch.no_grad():
+					out_ids = model.generate(**inputs, **self.gen_kwargs)
+				if isinstance(out_ids, torch.Tensor):
+					seq = out_ids[0].cpu().tolist()
+				else:
+					seq = out_ids[0]
+				full_text = self.tokenizer.decode(seq, skip_special_tokens=True)
+				pred = full_text[len(prompt):].strip() if full_text.startswith(prompt) else full_text.strip()
+				# Truncate for readability
+				def _trunc(s, n=180):
+					return (s[:n] + '…') if len(s) > n else s
+				print(f"\n[TrainSample step={state.global_step}]\nPrompt(fragment): {_trunc(prompt)}\nTarget(fragment): {_trunc(target)}\nPred(fragment): {_trunc(pred)}\n---")
+		callbacks.append(TrainSamplePrinterCallback(raw_datasets=ds, tokenizer=tokenizer, gen_kwargs=gen_kwargs, every=args.print_train_example_every))
 
 	# Functional evaluator callback: runs generated code in a subprocess sandbox and logs pass@k
 	class FunctionalEvaluatorCallback(TrainerCallback):
