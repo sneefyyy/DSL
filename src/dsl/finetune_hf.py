@@ -870,6 +870,9 @@ def main():
 					return
 				# Random example
 				import random
+				# Defensive local import to avoid NameError in some notebook / partial import scenarios
+				# where the top-level import torch may not yet be bound in this callback's closure.
+				import torch as _torch_local
 				ex = dict(train_ds[random.randrange(len(train_ds))])
 				prompt = ex.get('prompt')
 				target = ex.get('completion','').strip()
@@ -881,9 +884,9 @@ def main():
 				device = next(model.parameters()).device
 				inputs = self.tokenizer(prompt, return_tensors='pt')
 				inputs = {k: v.to(device) for k,v in inputs.items()}
-				with torch.no_grad():
+				with _torch_local.no_grad():
 					out_ids = model.generate(**inputs, **self.gen_kwargs)
-				if isinstance(out_ids, torch.Tensor):
+				if isinstance(out_ids, _torch_local.Tensor):
 					seq = out_ids[0].cpu().tolist()
 				else:
 					seq = out_ids[0]
