@@ -567,6 +567,14 @@ def main():
 	if args.use_peft:
 		try:
 			from peft import get_peft_model, LoraConfig, TaskType
+			# For k-bit training (4/8bit) prepare model (enables input gradients, casts layer norms, etc.)
+			if (args.load_in_4bit or args.load_in_8bit):
+				try:
+					from peft import prepare_model_for_kbit_training
+					model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
+					logger.info('Prepared model for k-bit training (input gradients & layer norm casting).')
+				except Exception as prep_e:
+					logger.warning('prepare_model_for_kbit_training failed or unavailable: %s', prep_e)
 			# Determine target modules
 			target_modules = None
 			if args.peft_target_modules:
@@ -598,6 +606,12 @@ def main():
 			)
 			model = get_peft_model(model, lora_config)
 			logger.info('Enabled LoRA with r=%d alpha=%d on modules=%s', args.peft_r, args.peft_alpha, target_modules)
+			# Sanity check: ensure we actually have trainable parameters
+			trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+			total = sum(p.numel() for p in model.parameters())
+			logger.info('Trainable parameters: %s (%.2f%% of total %s)', f'{trainable:,}', 100.0*trainable/total if total else 0.0, f'{total:,}')
+			if trainable == 0:
+				raise ValueError('No trainable parameters detected after LoRA initialization. Specify --peft_target_modules or disable 4bit/8bit quantization.')
 		except Exception as e:
 			logger.warning('PEFT/LoRA requested but could not be enabled: %s', e)
 
