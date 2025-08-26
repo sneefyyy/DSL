@@ -15,6 +15,59 @@ Usage (example):
 Be cautious: running full training requires GPU and enough disk space.
 """
 
+# ============================================================================
+# READING GUIDE (advanced user focused)
+# ============================================================================
+# High-level pipeline flow:
+#   1. CLI args parsed (see main()).
+#   2. Dataset loaded (local path or hub) -> mapped to prompt/completion format.
+#   3. (Optional) curriculum filtering & smoke test sub-sampling.
+#   4. Tokenizer & model loaded (with optional 4/8-bit quant + FlashAttention + bf16).
+#   5. Optional gradient checkpointing and PEFT/LoRA wrapping (k-bit prep first).
+#   6. Dataset tokenized with label masking (-100 over prompt tokens) -> HF Datasets object.
+#   7. Trainer (ExactMatchTrainer subclass) instantiated with:
+#        - custom generation-based exact-match metric (validation + sampled train subset)
+#        - optional callbacks: prediction samples, functional execution (runs code), sample printer
+#   8. Training via Trainer; evaluation either per epoch or every N steps.
+#   9. Optional final test exact-match + functional pass@k evaluation.
+#  10. (Optional) push to Hub.
+#
+# Key design motivations:
+#   - PROMPT / COMPLETION SPLIT: We mask prompt loss to focus optimization on solution tokens only.
+#   - EXACT-MATCH VIA GENERATE: We generate instead of relying on teacher-forced logits to approximate real inference behavior.
+#   - FUNCTIONAL EVAL: Sandbox `exec` of predicted Python to verify produced grid equals target (pragmatic correctness metric beyond string match).
+#   - K-BIT + LoRA: QLoRA-style memory efficiency; `prepare_model_for_kbit_training` ensures gradients flow only through LoRA adapters + small norms.
+#   - CURRICULUM (static first stage only): Allow external manual multi-stage runs without complicating Trainer loop.
+#   - CALLBACK MODULARITY: Each concern (prediction logging / functional exec / train sample) isolated for easy removal.
+#
+# Recommended path to grok the file:
+#   A. Skim CLI args to see feature surface & toggles.
+#   B. Read `format_example_for_training_local` (prompt spec) & `tokenize_and_build_labels` (label masking logic).
+#   C. Inspect quantization + LoRA block (model loading rationale + memory decisions).
+#   D. Examine `ExactMatchTrainer.compute_exact_match` for eval pipeline.
+#   E. Review `FunctionalEvaluatorCallback` for sandbox pattern and reasoning about risk/timeouts.
+#   F. Finally scan the main() linear orchestration to see assembly ordering.
+#
+# Debug / validation tips (expert level):
+#   - Verify mask correctness: run a tiny batch and assert all pre-completion token positions have label -100.
+#   - Sanity-check generation: before training, generate on 1-2 examples to ensure decoding splits prompt from completion correctly.
+#   - Confirm LoRA active: print number of trainable params (already logged) & ensure >0 but << total.
+#   - When using 4-bit: inspect a base weight dtype (should be int8/4bit quantized module) while LoRA injected weights are fp16/bf16.
+#   - Performance profiling: disable functional eval (`--disable_functional_eval`) to isolate pure LM training speed.
+#   - Smoke run: set `SMOKE_TEST=1` env var + `--max_steps 20 --eval_every_steps 10` for quick end-to-end verification.
+#
+# Extension ideas:
+#   - Add pass@k mid-training by adjusting FunctionalEvaluatorCallback num_return_sequences.
+#   - Introduce dynamic curriculum by subclassing Trainer and overriding training loop (heavier change).
+#   - Stream metrics to custom dashboard by adding another callback hooking on `on_log`.
+#
+# Safety / caveats:
+#   - Executing model-generated code is inherently risky; we confine execution to a fresh process + limited timeout, BUT not a hardened sandbox.
+#   - For hostile inputs or untrusted models, use a real sandbox (firejail, gvisor) or disable functional eval.
+#
+# Reading order markers below: look for "==== SECTION" banners for quick navigation.
+# ============================================================================
+
 # ---------------------------------------------------------------------------
 # Robust temp directory fallback
 # Some Colab / restricted environments can surface a FileNotFoundError when
@@ -90,6 +143,9 @@ def format_example_for_training_local(example):
 	ENTIRE solution (all lines joined by newlines) so the model learns the full
 	multi-line program, not only the first line.
 	"""
+	# NOTE: We intentionally embed exactly two train examples + one test input.
+	# Rationale: few-shot pattern induction while controlling prompt length.
+	# If you want dynamic k-shot, you'd extend this to sample k examples per task.
 	import json as _json
 	prompt = (
 		"Training Example 1:\n"
@@ -111,6 +167,8 @@ def format_example_for_training_local(example):
 
 def tokenize_and_build_labels(example, tokenizer, max_length=1024):
 	# Tokenize prompt and completion separately so we can mask the prompt tokens
+	# Advanced note: We avoid packing multiple examples per sequence for simplicity;
+	# if throughput is a bottleneck you could implement sequence packing (careful with label masks).
 	prompt = example['prompt']
 	completion = example['completion']
 
@@ -118,6 +176,7 @@ def tokenize_and_build_labels(example, tokenizer, max_length=1024):
 	completion_ids = tokenizer.encode(completion, add_special_tokens=False)
 
 	# Ensure there's room for completion; truncate prompt from the left if needed
+	# Left-side truncation keeps the most recent (closest) demonstration examples if prompt too long.
 	total_needed = len(prompt_ids) + len(completion_ids) + 1  # +1 for eos
 	if total_needed > max_length:
 		keep = max_length - len(completion_ids) - 1
@@ -141,6 +200,8 @@ class DataCollatorForCausalLMWithPadding:
 		self.label_pad_token_id = label_pad_token_id
 
 	def __call__(self, features):
+		# We perform manual padding (rather than using HF default) to keep explicit control
+		# over label padding semantics and avoid inadvertently adding special tokens.
 		input_ids = [torch.tensor(f['input_ids'], dtype=torch.long) for f in features]
 		labels = [torch.tensor(f['labels'], dtype=torch.long) for f in features]
 
@@ -157,6 +218,8 @@ class ExactMatchTrainer(Trainer):
 	by running generation with the provided tokenizer and comparing the generated
 	completion (text after the prompt) to the reference `completion` field.
 	"""
+	# Design emphasis: evaluate realistic inference path (autoregressive generate) rather than
+	# teacher-forced next-token accuracy. This penalizes early hallucination / divergence.
 	def __init__(self, *args, tokenizer_for_eval=None, raw_datasets=None, gen_kwargs=None, use_wandb=False, train_eval_samples=None, **kwargs):
 		super().__init__(*args, **kwargs)
 		self.tokenizer_for_eval = tokenizer_for_eval
@@ -172,6 +235,9 @@ class ExactMatchTrainer(Trainer):
 
 		Returns (correct, total, pct)
 		"""
+		# Perf note: naive loop + generate; if validation set large you can
+		#   a) sample (already supported), b) batch generation with padding.
+		# We keep it scalar for clarity / debugging introspection.
 		ds = self.raw_datasets.get(split_name)
 		if ds is None:
 			return 0, 0, 0.0
@@ -193,6 +259,7 @@ class ExactMatchTrainer(Trainer):
 			it = (ds[i] for i in indices)
 
 		for ex in it:
+			# Single-example generate (greedy by default) — deterministic exact-match metric.
 			prompt = ex.get('prompt')
 			target = ex.get('completion', '').strip()
 			if prompt is None:
@@ -233,6 +300,7 @@ class PredictionLogger(TrainerCallback):
 		self.use_wandb = use_wandb
 
 	def on_evaluate(self, args, state, control, **kwargs):
+		# Runs AFTER Trainer evaluation; we do lightweight sampling to inspect qualitative drift.
 		model = kwargs.get('model')
 		if model is None:
 			return
@@ -344,6 +412,9 @@ class PredictionLogger(TrainerCallback):
 
 def main():
 	parser = argparse.ArgumentParser()
+	# ==== SECTION: CLI ARGUMENTS ==================================================
+	# The CLI surface is intentionally verbose to allow iterative experimentation
+	# without editing code. Grouped conceptually (model, dataset, PEFT, quant, eval, perf).
 	parser.add_argument('--model_name_or_path', type=str, default='gpt2')
 	parser.add_argument('--dataset_id', type=str, default='middles/dsl-arc-dataset')
 	parser.add_argument('--output_dir', type=str, default='./dsl-finetuned')
@@ -419,6 +490,8 @@ def main():
 	args = parser.parse_args()
 
 	logger.info('Loading dataset: %s', args.dataset_id)
+	# ==== SECTION: DATA LOADING ===================================================
+	# Supports either a local saved dataset directory (load_from_disk) or hub dataset id.
 	# If the dataset_id is a local path saved via Dataset.save_to_disk, use load_from_disk
 	if os.path.isdir(args.dataset_id):
 		try:
@@ -448,6 +521,7 @@ def main():
 
 	# Map formatting to prompt/completion
 	logger.info('Formatting examples (prompt/completion)')
+	# After this map, each example acquires prompt/completion/full_text fields used downstream.
 	ds = ds.map(lambda ex: format_example_for_training_local(ex), batched=False)
 
 	# Optional curriculum: we won't stage dynamically during one run (Trainer lacks native hooks here without custom loop)
@@ -476,6 +550,7 @@ def main():
 
 	# Load tokenizer and model
 	logger.info('Loading tokenizer and model: %s', args.model_name_or_path)
+	# ==== SECTION: TOKENIZER ======================================================
 	tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code)
 	# Ensure pad token exists
 	if tokenizer.pad_token is None:
@@ -483,6 +558,9 @@ def main():
 
 	model_kwargs = {}
 	# BitsAndBytes quantization config if requested
+	# ==== SECTION: QUANTIZATION ===================================================
+	# We configure BitsAndBytes BEFORE model load so that `from_pretrained` instantiates
+	# quantized Linear modules directly (avoids full fp16/fp32 memory spike).
 	if args.load_in_4bit or args.load_in_8bit:
 		try:
 			import importlib
@@ -525,6 +603,7 @@ def main():
 	if args.device_map:
 		model_kwargs['device_map'] = args.device_map
 	try:
+		# Primary load path with advanced kwargs (quantization, flash attn, dtype, device map, etc.)
 		model = AutoModelForCausalLM.from_pretrained(
 			args.model_name_or_path,
 			trust_remote_code=args.trust_remote_code,
@@ -532,6 +611,7 @@ def main():
 			**model_kwargs,
 		)
 	except Exception as e:
+		# Fallback path: drop advanced knobs except quantization to maximize success chance.
 		logger.warning('Model load with provided kwargs failed (%s). Retrying without advanced kwargs.', e)
 		fallback_kwargs = {k: v for k, v in model_kwargs.items() if k in ('quantization_config',)}
 		model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code, **fallback_kwargs)
@@ -565,6 +645,9 @@ def main():
 
 	# Optionally apply PEFT/LoRA
 	if args.use_peft:
+		# ==== SECTION: PEFT / LoRA ==================================================
+		# Sequence: (1) prepare model for k-bit (if quantized) -> (2) select target Linear modules -> (3) wrap with LoRA.
+		# Any failure keeps base model untouched (logged as warning) so experiments still proceed.
 		try:
 			from peft import get_peft_model, LoraConfig, TaskType
 			# For k-bit training (4/8bit) prepare model (enables input gradients, casts layer norms, etc.)
@@ -631,6 +714,8 @@ def main():
 
 	# Tokenize and build labels
 	logger.info('Tokenizing and building labels (this may take a while)')
+	# Tokenization is intentionally late (after LoRA) because resizing embeddings must occur before
+	# creating batches whose pad token id depends on possibly newly-added pad embedding.
 	def _tok(ex):
 		return tokenize_and_build_labels(ex, tokenizer, max_length=args.max_length)
 
@@ -659,6 +744,7 @@ def main():
 	report_to = ['wandb'] if args.use_wandb else []
 
 	if args.eval_every_steps and args.eval_every_steps > 0:
+		# Step-based eval/save enables overlapped curves (train/eval have same x-axis resolution) for W&B dashboards.
 		eval_strategy = 'steps'
 		save_strategy = 'steps'
 		eval_steps = args.eval_every_steps
@@ -756,6 +842,7 @@ def main():
 		'pad_token_id': tokenizer.pad_token_id or tokenizer.eos_token_id,
 		'eos_token_id': tokenizer.eos_token_id,
 	}
+	# NOTE: Generation kwargs tuned for deterministic exact-match; adjust for diversity in functional pass@k.
 
 	callbacks = []
 	if args.early_stopping_patience and args.early_stopping_patience > 0:
@@ -810,6 +897,14 @@ def main():
 
 	# Functional evaluator callback: runs generated code in a subprocess sandbox and logs pass@k
 	class FunctionalEvaluatorCallback(TrainerCallback):
+		# ==== SECTION: FUNCTIONAL EVALUATOR =========================================
+		# Purpose: Evaluate *semantic* correctness by executing generated code.
+		# Mechanics: For a sample of validation examples we:
+		#   - Recreate prompt
+		#   - Generate candidate solution (greedy by default mid-training)
+		#   - Exec candidate in isolated process (timeout) & capture produced grid
+		#   - Compare to target test_output -> functional success
+		# Security: Minimal. Not safe for arbitrary untrusted code. Use a hardened sandbox in production.
 		def __init__(self, tokenizer, raw_datasets, gen_kwargs=None, sample_n=50, num_return_sequences=1, exec_timeout=2.0, use_wandb=False):
 			self.tokenizer = tokenizer
 			self.raw_datasets = raw_datasets or {}
@@ -846,6 +941,7 @@ def main():
 			self._worker = _worker
 
 		def run_solution_subprocess(self, code_str, test_input, timeout=2.0):
+			# Spawns a short-lived process; canonical pattern to avoid hangs / infinite loops.
 			q = multiprocessing.Queue()
 			p = multiprocessing.Process(target=self._worker, args=(code_str, test_input, q))
 			p.start()
@@ -864,6 +960,7 @@ def main():
 				return None, f"Timeout after {timeout}s"
 
 		def on_evaluate(self, args, state, control, **kwargs):
+			# Called after each evaluation; we piggyback on that cadence for functional diagnostics.
 			trainer = kwargs.get('trainer')
 			model = kwargs.get('model') or (trainer.model if trainer else None)
 			if model is None:
@@ -957,6 +1054,8 @@ def main():
 		callbacks.append(FunctionalEvaluatorCallback(tokenizer=tokenizer, raw_datasets=ds, gen_kwargs=gen_kwargs, sample_n=args.functional_eval_sample_n, num_return_sequences=1, exec_timeout=2.0, use_wandb=args.use_wandb))
 
 	trainer = ExactMatchTrainer(
+		# ==== SECTION: TRAINER INSTANTIATION ========================================
+		# Provide raw datasets & tokenizer separately for custom generation metrics; keep HF datasets tokenized.
 		model=model,
 		args=training_args,
 		train_dataset=train_dataset,
@@ -978,6 +1077,7 @@ def main():
 
 	# Optional final test evaluation (skip when --skip_final_test)
 	if not args.skip_final_test and 'test' in tokenized:
+		# Final exact-match & loss on holdout; distinct path from mid-train eval to avoid confusion with trainer state.
 		try:
 			logger.info('Evaluating on test split (final)')
 			test_dataset = tokenized['test']
@@ -1000,6 +1100,7 @@ def main():
 
 	# Final functional execution evaluation (pass@k) if requested
 	if args.final_functional_test and 'test' in ds:
+		# Final pass@k evaluation optionally with sampling for diversity when k>1.
 		logger.info('Starting final functional execution evaluation on test split (pass@%d)', args.final_functional_pass_k)
 		import random, time, multiprocessing, queue as _queue, copy as _copy
 		model = trainer.model
