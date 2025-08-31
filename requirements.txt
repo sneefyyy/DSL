@@ -1,3 +1,8 @@
 datasets
 pyarrow
 pytest
+matplotlib
+transformers
+peft
+accelerate
+bitsandbytes
