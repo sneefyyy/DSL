@@ -129,6 +129,7 @@ import multiprocessing
 import queue
 import copy
 import json
+import statistics
 
 
 logging.basicConfig(level=logging.INFO)
@@ -220,7 +221,7 @@ class ExactMatchTrainer(Trainer):
 	"""
 	# Design emphasis: evaluate realistic inference path (autoregressive generate) rather than
 	# teacher-forced next-token accuracy. This penalizes early hallucination / divergence.
-	def __init__(self, *args, tokenizer_for_eval=None, raw_datasets=None, gen_kwargs=None, use_wandb=False, train_eval_samples=None, **kwargs):
+	def __init__(self, *args, tokenizer_for_eval=None, raw_datasets=None, gen_kwargs=None, use_wandb=False, train_eval_samples=None, end_sentinel=None, **kwargs):
 		super().__init__(*args, **kwargs)
 		self.tokenizer_for_eval = tokenizer_for_eval
 		self.raw_datasets = raw_datasets or {}
@@ -229,6 +230,8 @@ class ExactMatchTrainer(Trainer):
 		self.use_wandb = use_wandb
 		# How many training examples to sample when computing train exact-match (None => full)
 		self.train_eval_samples = train_eval_samples
+		# Optional end sentinel to strip when comparing predictions
+		self.end_sentinel = end_sentinel
 
 	def compute_exact_match(self, split_name, max_samples=None):
 		"""Compute exact match percent for a given split in raw_datasets.
@@ -259,27 +262,32 @@ class ExactMatchTrainer(Trainer):
 			it = (ds[i] for i in indices)
 
 		for ex in it:
-			# Single-example generate (greedy by default) — deterministic exact-match metric.
 			prompt = ex.get('prompt')
 			target = ex.get('completion', '').strip()
 			if prompt is None:
 				continue
-
 			inputs = self.tokenizer_for_eval(prompt, return_tensors='pt')
 			inputs = {k: v.to(device) for k, v in inputs.items()}
-
 			with torch.no_grad():
 				out_ids = model.generate(**inputs, **gen_kwargs)
-
 			if isinstance(out_ids, torch.Tensor):
-				seq = out_ids[0].cpu().tolist()
+				seq_full = out_ids[0].cpu()
+				input_len = inputs['input_ids'].shape[1]
+				gen_part = seq_full[input_len:]
+				comp = self.tokenizer_for_eval.decode(gen_part, skip_special_tokens=True).strip()
 			else:
 				seq = out_ids[0]
-
-			gen_text = self.tokenizer_for_eval.decode(seq, skip_special_tokens=True).strip()
-			comp = gen_text[len(prompt):].strip() if gen_text.startswith(prompt) else gen_text
-
-			if comp == target:
+				# Fallback: slice by input length if possible
+				input_len = inputs['input_ids'].shape[1]
+				comp_ids = seq[input_len:]
+				comp = self.tokenizer_for_eval.decode(comp_ids, skip_special_tokens=True).strip()
+			if self.end_sentinel and comp.endswith(self.end_sentinel):
+				comp = comp[: -len(self.end_sentinel)].rstrip()
+			if target.endswith(self.end_sentinel):
+				target_cmp = target[: -len(self.end_sentinel)].rstrip()
+			else:
+				target_cmp = target
+			if comp == target_cmp:
 				correct += 1
 			total += 1
 
@@ -487,6 +495,8 @@ def main():
 	parser.add_argument('--eval_temp_enable_cache', action='store_true', help='Temporarily enable model.config.use_cache during generation in evaluations even if disabled for training (speeds up eval generation)')
 	# Console sample printing
 	parser.add_argument('--print_train_example_every', type=int, default=0, help='If >0, every N optimizer steps print a random training example prompt + target + current model prediction.')
+	parser.add_argument('--end_sentinel', type=str, default='<END>', help='Special string appended to each completion to mark end; added as special token.')
+	parser.add_argument('--debug_token_stats', action='store_true', help='Print token length stats for prompt/completion after tokenization and abort (for data inspection).')
 	args = parser.parse_args()
 
 	logger.info('Loading dataset: %s', args.dataset_id)
@@ -524,6 +534,16 @@ def main():
 	# After this map, each example acquires prompt/completion/full_text fields used downstream.
 	ds = ds.map(lambda ex: format_example_for_training_local(ex), batched=False)
 
+	# Append end sentinel to completions now (raw dataset) so it is part of training objective
+	if args.end_sentinel:
+		def _append_sentinel(ex):
+			c = ex.get('completion','') or ''
+			if not c.endswith(args.end_sentinel):
+				ex['completion'] = (c.rstrip() + '\n' + args.end_sentinel) if c.strip() else args.end_sentinel
+				ex['full_text'] = ex.get('prompt','') + ex['completion']
+			return ex
+		ds = ds.map(_append_sentinel)
+
 	# Optional curriculum: we won't stage dynamically during one run (Trainer lacks native hooks here without custom loop)
 	# Instead we implement a static single-stage subset selection for early experimentation OR
 	# allow user to manually iterate stages externally (
@@ -552,9 +572,22 @@ def main():
 	logger.info('Loading tokenizer and model: %s', args.model_name_or_path)
 	# ==== SECTION: TOKENIZER ======================================================
 	tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code)
-	# Ensure pad token exists
+	# Ensure pad token exists and add end sentinel token if needed
+	add_tokens = []
 	if tokenizer.pad_token is None:
-		tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token or tokenizer.sep_token or '<|pad|>'})
+		pad_candidate = tokenizer.eos_token or tokenizer.sep_token or '<|pad|>'
+		add_tokens.append(pad_candidate)
+	# Only add end sentinel as special token if not already present and non-empty
+	if args.end_sentinel and args.end_sentinel not in tokenizer.get_vocab():
+		add_tokens.append(args.end_sentinel)
+	if add_tokens:
+		# Prepare dict; if pad already set earlier, don't overwrite inadvertently
+		specials = {'additional_special_tokens': [t for t in add_tokens if t != tokenizer.pad_token]}
+		if tokenizer.pad_token is None and add_tokens:
+			specials['pad_token'] = add_tokens[0]
+		added = tokenizer.add_special_tokens(specials)
+		if added:
+			logger.info('Added %d special tokens (pad + additional): %s', added, add_tokens)
 
 	model_kwargs = {}
 	# BitsAndBytes quantization config if requested
@@ -723,6 +756,15 @@ def main():
 	for split in ds.keys():
 		tokenized_split = ds[split].map(lambda ex: _tok(ex), remove_columns=ds[split].column_names)
 		tokenized[split] = tokenized_split
+
+	# Optional debug: print token stats and exit early
+	if args.debug_token_stats:
+		for split, dset in tokenized.items():
+			lengths = [len(r['labels']) - sum(1 for x in r['labels'] if x == -100) for r in dset]
+			if lengths:
+				logger.info('[TokenStats] split=%s completion_tokens: min=%d p50=%.1f p95=%.1f max=%d', split, min(lengths), statistics.median(lengths), statistics.quantiles(lengths, n=20)[18], max(lengths))
+		logger.info('Debug token stats requested; exiting early.')
+		return
 
 	# Optional smoke-test: sample a few examples from each split to speed up quick runs
 	if os.environ.get('SMOKE_TEST') == '1':
@@ -1069,6 +1111,7 @@ def main():
 		gen_kwargs=gen_kwargs,
 		use_wandb=args.use_wandb,
 		train_eval_samples=(None if args.train_eval_samples <= 0 else args.train_eval_samples),
+		end_sentinel=args.end_sentinel,
 		callbacks=callbacks if callbacks else None,
 	)
 

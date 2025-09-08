@@ -7,6 +7,10 @@ import sys
 from pathlib import Path
 import inspect
 from generators import *  # Import all generators
+try:
+    from src.dsl import dsl_functions  # canonical wrappers
+except Exception:
+    dsl_functions = None
 
 class ExampleInterpreter:
     """
@@ -69,6 +73,13 @@ class ExampleInterpreter:
         
         # Add all discovered generator classes
         namespace.update(self.generator_classes)
+
+        # Add canonical DSL functions if available
+        if dsl_functions is not None:
+            for name in getattr(dsl_functions, 'ALL_DSL_FUNCTIONS', []):
+                func = getattr(dsl_functions, name, None)
+                if callable(func):
+                    namespace[name] = func
         
         # Create instances for non-base generators
         for class_name, class_obj in self.generator_classes.items():
