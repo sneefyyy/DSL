@@ -1,14 +1,3 @@
-
----
-license: mit
-task_categories:
-- text-generation
-language:
-- en
-size_categories:
-- 10K<n<100K
----
-
 # DSL ARC Dataset
 
 Dataset for training models on ARC-like tasks using a Domain Specific Language.
@@ -195,7 +184,3 @@ Important implementation details
 - When adding a new generator, implement `create_fewshot_examples()` returning examples obeying the dataset schema. Add a short test in `src/dsl/interpreter.py` to smoke-run a few examples.
 - To extend functional evaluation (more rigorous pass@k), modify `src/dsl/evaluate_model.py` to generate larger candidate pools and use the standard pass@k estimator.
 
----
-If you'd like, I can also:
-- produce a Colab notebook pre-configured to run a PEFT finetune (already added as `colab_finetune_dsl.ipynb`), or
-- add a CLI flag to `finetune_hf.py` to control `FunctionalEvaluatorCallback` sample size and candidate count for easier tuning.
