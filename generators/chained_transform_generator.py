@@ -339,3 +339,4 @@ class ChainedTransformGenerator(ExampleGenerator):
         for _ in range(num_examples):
             examples.append(self.build_example())
         return examples
+    

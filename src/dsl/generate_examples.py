@@ -20,6 +20,8 @@ from generators.count_and_transform_generator import CountAndTransformGenerator
 from generators.gravity_generator import GravityGenerator
 from generators.modify_neighbors import ModifyNeighborsGenerator
 from generators.filter_objects import FilterObjectsGenerator
+from generators.color_map_with_transform import ColorMapWithTransformGenerator
+from generators.generate_background_pattern import GenerateBackgroundPatternGenerator
 
 if __name__ == "__main__":
 	json_training_dir = "JSON_training/"
@@ -64,6 +66,12 @@ if __name__ == "__main__":
 
 	generator = FilterObjectsGenerator(size=5)
 	generator.save_fewshot_examples(os.path.join(json_training_dir, "FilterObjects.json"), num_examples=4000)
+
+	generator = ColorMapWithTransformGenerator(size=5)
+	generator.save_fewshot_examples(os.path.join(json_training_dir, "ColorMapWithTransform.json"), num_examples=4000)
+
+	generator = GenerateBackgroundPatternGenerator(size=5)
+	generator.save_fewshot_examples(os.path.join(json_training_dir, "GenerateBackgroundPattern.json"), num_examples=4000)
 
 	# You can also generate and inspect a single example directly:
 	# single_example = generator.generate_connect_example()
