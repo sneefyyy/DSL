@@ -1,4 +1,11 @@
 import os
+import sys
+from pathlib import Path
+
+# Add project root to Python path
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
 # Import the ConnectSegmentGenerator class
 from generators.move_shape import MoveShapeGenerator
 from generators.connect import ConnectGenerator
@@ -10,6 +17,9 @@ from generators.symmetry_complete_generator import SymmetryCompleteGenerator
 from generators.extract_pattern_generator import ExtractPatternGenerator
 from generators.repeat_pattern_generator import RepeatPatternGenerator
 from generators.count_and_transform_generator import CountAndTransformGenerator
+from generators.gravity_generator import GravityGenerator
+from generators.modify_neighbors import ModifyNeighborsGenerator
+from generators.filter_objects import FilterObjectsGenerator
 
 if __name__ == "__main__":
 	json_training_dir = "JSON_training/"
@@ -45,6 +55,15 @@ if __name__ == "__main__":
 
 	generator = CountAndTransformGenerator(size=5)
 	generator.save_fewshot_examples(os.path.join(json_training_dir, "CountAndTransform.json"), num_examples=4000)
+
+	generator = GravityGenerator(size=5)
+	generator.save_fewshot_examples(os.path.join(json_training_dir, "Gravity.json"), num_examples=4000)
+
+	generator = ModifyNeighborsGenerator(size=5)
+	generator.save_fewshot_examples(os.path.join(json_training_dir, "ModifyNeighbors.json"), num_examples=4000)
+
+	generator = FilterObjectsGenerator(size=5)
+	generator.save_fewshot_examples(os.path.join(json_training_dir, "FilterObjects.json"), num_examples=4000)
 
 	# You can also generate and inspect a single example directly:
 	# single_example = generator.generate_connect_example()
