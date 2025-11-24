@@ -184,3 +184,4 @@ Important implementation details
 - When adding a new generator, implement `create_fewshot_examples()` returning examples obeying the dataset schema. Add a short test in `src/dsl/interpreter.py` to smoke-run a few examples.
 - To extend functional evaluation (more rigorous pass@k), modify `src/dsl/evaluate_model.py` to generate larger candidate pools and use the standard pass@k estimator.
 
+this has been executed by mcp
